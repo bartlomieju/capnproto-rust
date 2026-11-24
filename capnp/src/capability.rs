@@ -60,6 +60,17 @@ pub struct Promise<T, E> {
 enum PromiseInner<T, E> {
     Immediate(Result<T, E>),
     Deferred(Pin<alloc::boxed::Box<dyn Future<Output = core::result::Result<T, E>> + 'static>>),
+    /// An untyped response's future, retyped by the function as it completes. A response of any
+    /// type is just its hook, so retyping one needs no future of its own.
+    Response(
+        Pin<
+            alloc::boxed::Box<
+                dyn Future<Output = core::result::Result<Response<any_pointer::Owned>, E>>
+                    + 'static,
+            >,
+        >,
+        fn(Response<any_pointer::Owned>) -> T,
+    ),
     Empty,
 }
 
@@ -105,7 +116,31 @@ impl<T, E> Future for Promise<T, E> {
                 }
             }
             PromiseInner::Deferred(ref mut f) => f.as_mut().poll(cx),
+            PromiseInner::Response(ref mut f, retype) => f.as_mut().poll(cx).map(|r| r.map(retype)),
         }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<E> Promise<Response<any_pointer::Owned>, E> {
+    /// The promise of the same response, typed as `Results`. Unlike mapping the promise through
+    /// a new future, this allocates nothing.
+    fn into_typed<Results>(self) -> Promise<Response<Results>, E> {
+        fn retype<Results>(response: Response<any_pointer::Owned>) -> Response<Results> {
+            Response {
+                hook: response.hook,
+                marker: PhantomData,
+            }
+        }
+        let inner = match self.inner {
+            PromiseInner::Immediate(r) => PromiseInner::Immediate(r.map(retype)),
+            PromiseInner::Deferred(f) => PromiseInner::Response(f, retype),
+            // Retyping only moves the hook, so `retype` alone gives what the original function
+            // and `retype` together would.
+            PromiseInner::Response(f, _) => PromiseInner::Response(f, retype),
+            PromiseInner::Empty => PromiseInner::Empty,
+        };
+        Promise { inner }
     }
 }
 
@@ -216,14 +251,8 @@ where
         let RemotePromise {
             promise, pipeline, ..
         } = self.hook.send();
-        let typed_promise = Promise::from_future(async move {
-            Ok(Response {
-                hook: promise.await?.hook,
-                marker: PhantomData,
-            })
-        });
         RemotePromise {
-            promise: typed_promise,
+            promise: promise.into_typed(),
             pipeline: FromTypelessPipeline::new(pipeline),
         }
     }
